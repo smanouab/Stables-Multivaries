@@ -1,0 +1,248 @@
+---
+title: "Familles de Tweedie multivariées engendrées par des lois α-stables"
+subtitle: "Notebook compagnon : simulation exacte et vérification numérique des résultats du manuscrit"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.2, dpi = 110,
+                      dev = c("png", "cairo_pdf"), fig.path = "figs/",
+                      dev.args = list(png = list(bg = "white"), cairo_pdf = list(bg = "white")))
+```
+
+> Ce notebook accompagne le document *« Analyse critique et compléments »*. Il simule
+> **exactement** les familles du manuscrit (lois stables positives basculées
+> exponentiellement) et confronte aux simulations : la moyenne (11), la variance (14),
+> les formes fermées (17) et (19), l'homogénéité (16), la variance généralisée
+> $\det V_F(m)=c\,m_1^{p+d-1}$ des modèles normaux stables, ainsi que les deux
+> corrections proposées (raideur et dépendance négative).
+
+# Outils
+
+```{r outils}
+library(MASS)
+set.seed(2026)
+pal <- c(bleu = "#1f4e79", rouge = "#c0504d", vert = "#2e8b57", or = "#d48a00",
+         violet = "#6a3d9a", gris = "#7f7f7f")
+
+## Générateur de Chambers-Mallows-Stuck, paramétrisation S_alpha(sigma, beta, mu) de
+## Samorodnitsky-Taqqu (on n'utilise pas stabledist::rstable : bug pour alpha=1, beta!=0 en v0.7-1)
+rS <- function(n, alpha, beta = 0, sigma = 1, mu = 0) {
+  V <- runif(n, -pi / 2, pi / 2); W <- rexp(n)
+  tb <- beta * tan(pi * alpha / 2); B <- atan(tb) / alpha; Sab <- (1 + tb^2)^(1 / (2 * alpha))
+  X <- Sab * sin(alpha * (V + B)) / cos(V)^(1 / alpha) * (cos(V - alpha * (V + B)) / W)^((1 - alpha) / alpha)
+  sigma * X + mu
+}
+## Loi stable positive de transformée de Laplace E exp(-sY) = exp(-g s^a), 0 < a < 1
+## (S_a(sigma,1,0) a pour Laplace exp(-sigma^a s^a / cos(pi a/2)))
+rpos <- function(n, a, g) rS(n, a, 1, (g * cos(pi * a / 2))^(1 / a), 0)
+## Loi basculée : densité proportionnelle à exp(-t y) nu_a(dy), t > 0 (rejet exact,
+## taux d'acceptation exp(-g t^a))
+rtilt <- function(n, a, g, t) {
+  out <- numeric(0)
+  while (length(out) < n) {
+    m <- ceiling(1.2 * (n - length(out)) / exp(-g * t^a)) + 10
+    y <- rpos(m, a, g); out <- c(out, y[runif(m) < exp(-t * y)])
+  }
+  out[1:n]
+}
+
+## Famille engendrée par un cône, mesure spectrale discrète Gamma = sum_k g_k delta(u_k)
+## (lignes de U = atomes u_k).  k(theta) = - sum_k g_k <-theta,u_k>^a          (6)
+kfun <- function(th, U, g, a) -sum(g * as.vector(-(U %*% th))^a)
+mfun <- function(th, U, g, a) { s <- as.vector(-(U %*% th)); colSums(a * g * s^(a - 1) * U) }  # (11)
+Vfun <- function(th, U, g, a) { s <- as.vector(-(U %*% th)); w <- a * (1 - a) * g * s^(a - 2)
+                                 crossprod(U, w * U) }                                           # (14)
+## Simulation exacte de P(theta, nu) : X = sum_k u_k Y_k, Y_k basculées indépendantes
+rcone <- function(n, th, U, g, a) {
+  s <- as.vector(-(U %*% th))
+  Y <- sapply(seq_along(g), function(k) rtilt(n, a, g[k], s[k])); Y %*% U
+}
+## Paramétrisation par la moyenne psi(m) : Newton amorti sur grad k(theta) = m
+psi <- function(m, U, g, a, th = -colSums(U) / nrow(U)) {
+  for (it in 1:200) {
+    r <- mfun(th, U, g, a) - m; if (sqrt(sum(r^2)) < 1e-12) break
+    step <- solve(Vfun(th, U, g, a), r); lam <- 1
+    while (any(-(U %*% (th - lam * step)) <= 0)) lam <- lam / 2
+    th <- th - lam * step
+  }
+  th
+}
+p_of <- function(a) (a - 2) / (a - 1)
+```
+
+# Vérification de la moyenne (11) et de la variance (14) par simulation exacte
+
+Cône de $\mathbb R^2$ engendré par trois atomes ($0^\circ$, $35^\circ$, $80^\circ$), $\alpha=0{,}5$ ($p=3$).
+
+```{r cone-verif, fig.height=4}
+a <- 0.5; ang <- c(0, 35, 80) * pi / 180; U <- cbind(cos(ang), sin(ang)); g <- c(1, 0.6, 0.8)
+th <- c(-0.8, -0.6)
+X <- rcone(2e5, th, U, g, a)
+print(rbind(moyenne_MC = colMeans(X), moyenne_11 = mfun(th, U, g, a)))
+print(list(cov_MC = round(cov(X), 4), V_14 = round(Vfun(th, U, g, a), 4)))
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+plot(X[1:4000, ], pch = 16, cex = .3, col = adjustcolor(pal["bleu"], .4), asp = 1,
+     xlim = c(0, 8), ylim = c(0, 8), xlab = "x1", ylab = "x2", main = "Échantillon de P(θ, ν), α = 0.5")
+for (k in 1:3) segments(0, 0, 10 * U[k, 1], 10 * U[k, 2], col = pal["rouge"], lwd = 2, lty = 2)
+points(t(mfun(th, U, g, a)), pch = 4, cex = 2, lwd = 3, col = pal["or"])
+legend("topright", c("atomes de Γ", "moyenne (11)"), col = pal[c("rouge", "or")], lty = c(2, NA),
+       pch = c(NA, 4), lwd = 2, bty = "n", cex = .8)
+## Convergence des moyennes empiriques
+ns <- round(10^seq(2, 5.3, length.out = 30))
+err <- sapply(ns, function(n) sqrt(sum((colMeans(X[1:n, ]) - mfun(th, U, g, a))^2)))
+plot(ns, err, log = "xy", type = "b", pch = 16, col = pal["vert"], xlab = "n", ylab = "|X̄ - m(θ)|",
+     main = "Erreur de la moyenne empirique")
+lines(ns, 2 * err[1] * sqrt(ns[1] / ns), lty = 2, col = pal["gris"])
+legend("topright", "pente -1/2", lty = 2, col = pal["gris"], bty = "n", cex = .8)
+```
+
+# Formes fermées : composantes indépendantes (17)
+
+```{r indep}
+a <- 0.6; p <- p_of(a); gi <- c(1, 2); Ui <- diag(2)
+mm <- c(1.5, 0.7); thi <- psi(mm, Ui, gi, a)
+kap <- a * (1 - a) * gi * (a * gi)^(-p)
+rbind(V_14 = diag(Vfun(thi, Ui, gi, a)), V_17 = kap * mm^p)
+```
+
+# Homogénéité de la fonction variance (16) : $V_F(tm)=t^pV_F(m)$
+
+```{r homogeneite, fig.height=3.8}
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+ts <- 10^seq(-1, 1, length.out = 21)
+for (a in c(0.5, 0.3)) {
+  p <- p_of(a); ang <- c(0, 35, 80) * pi / 180; U <- cbind(cos(ang), sin(ang)); g <- c(1, .6, .8)
+  m0 <- mfun(c(-0.8, -0.6), U, g, a)
+  Vt <- t(sapply(ts, function(t) { V <- Vfun(psi(t * m0, U, g, a), U, g, a); c(V[1, 1], V[1, 2], V[2, 2]) }))
+  matplot(log(ts), log(Vt), type = "l", lty = 1, lwd = 2, col = pal[1:3], xlab = "log t", ylab = "log V_ij(t m)",
+          main = sprintf("α = %.1f : pente p = %.2f", a, p))
+  for (j in 1:3) abline(log(Vt[11, j]), p, lty = 3, col = "black")
+  legend("topleft", c("V11", "V12", "V22", "droites de pente p"), col = c(pal[1:3], 1), lty = c(1, 1, 1, 3),
+         bty = "n", cex = .8)
+}
+```
+
+# Modèles normaux stables : variance (19) et variance généralisée à une seule composante
+
+Hiérarchie (8) basculée : sous $P(\theta,\nu)$, $X_1$ suit la loi stable positive basculée par
+$\eta=\theta_1+\tfrac12\|\theta_\perp\|^2$ et $X_\perp\mid X_1\sim N_{d-1}(X_1\theta_\perp,\,X_1 I)$.
+
+```{r nst, fig.height=3.8}
+rnst <- function(n, th, a, g) {
+  eta <- th[1] + sum(th[-1]^2) / 2
+  x1 <- rtilt(n, a, g, -eta)
+  cbind(x1, x1 * matrix(th[-1], n, length(th) - 1, byrow = TRUE) + sqrt(x1) * matrix(rnorm(n * (length(th) - 1)), n))
+}
+V19 <- function(m, a, g) { p <- p_of(a); c0 <- a * (1 - a) * g * (a * g)^(-p); d <- length(m)
+  c0 * m[1]^(p - 2) * tcrossprod(m) + m[1] * diag(c(0, rep(1, d - 1))) }
+a <- 0.5; g <- 1; th <- c(-1, 0.4, -0.3)
+Xn <- rnst(3e5, th, a, g); mN <- colMeans(Xn)
+eta <- th[1] + sum(th[-1]^2) / 2; m1 <- a * g * (-eta)^(a - 1)
+print(rbind(moyenne_MC = mN, moyenne_theorique = c(m1, m1 * th[-1])))
+print(list(cov_MC = round(cov(Xn), 3), V_19 = round(V19(c(m1, m1 * th[-1]), a, g), 3)))
+## Variance généralisée : det V = c m1^(p+d-1), indépendante de m_perp
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+d <- 3; res <- NULL
+for (a in c(0.5, 0.3)) for (e in seq(-2.5, -0.3, length.out = 8)) for (sh in c(0, 0.8)) {
+  thv <- c(e - sh^2, sh, -sh / 2)  # eta varie, theta_perp varie
+  Z <- rnst(1e5, thv, a, 1)
+  res <- rbind(res, c(a = a, m1 = mean(Z[, 1]), gv = det(cov(Z)), sh = sh))
+}
+for (a in c(0.5, 0.3)) {
+  r <- res[res[, "a"] == a, ]; p <- p_of(a); c0 <- a * (1 - a) * (a)^(-p)
+  plot(log(r[, "m1"]), log(r[, "gv"]), pch = ifelse(r[, "sh"] == 0, 16, 2), col = pal["bleu"],
+       xlab = "log m1", ylab = "log det(cov empirique)",
+       main = sprintf("α = %.1f : pente p+d-1 = %.2f", a, p + d - 1))
+  abline(log(c0), p + d - 1, col = pal["rouge"], lwd = 2)
+  legend("topleft", c("θ⊥ = 0", "θ⊥ ≠ 0", "log c + (p+d-1) log m1"), pch = c(16, 2, NA), lty = c(NA, NA, 1),
+         col = c(pal["bleu"], pal["bleu"], pal["rouge"]), bty = "n", cex = .8)
+}
+```
+
+```{r nst-scatter, fig.height=3.8}
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+Z <- rnst(5000, c(-1, 0.6, 0), 0.5, 1)
+plot(Z[, 1], Z[, 2], pch = 16, cex = .3, col = adjustcolor(pal["violet"], .5), xlab = "x1 (stable positive)",
+     ylab = "x2 (gaussienne conditionnelle)", main = "Normal stable, θ⊥ = (0.6, 0)", xlim = c(0, 6))
+Z2 <- rnst(5000, c(-1, -0.6, 0), 0.5, 1)
+plot(Z2[, 1], Z2[, 2], pch = 16, cex = .3, col = adjustcolor(pal["vert"], .5), xlab = "x1", ylab = "x2",
+     main = "θ⊥ = (-0.6, 0) : corrélation négative", xlim = c(0, 6))
+```
+
+# Correction 1 : la raideur (steepness) n'est pas automatique
+
+Pour $\Gamma$ **diffuse** (uniforme sur l'arc $[0,\pi/2]$ du quart de plan) la moyenne reste
+bornée quand $\theta$ tend vers un point du bord autre que $0$ ; pour $\Gamma$ **atomique** portée par les
+rayons extrêmes, elle explose. Le domaine des moyennes du cas diffus est le cône ouvert compris
+entre les directions $(1;\,0{,}599)$ et $(0{,}599;\,1)$, strictement inclus dans le quart de plan.
+
+```{r raideur, fig.height=4}
+a <- 0.5
+m_diff <- function(th) sapply(1:2, function(i) {
+  f <- function(ph) { s <- -(th[1] * cos(ph) + th[2] * sin(ph)); a * s^(a - 1) * (if (i == 1) cos(ph) else sin(ph)) }
+  cuts <- c(0, 0.05, pi / 4, pi / 2 - 0.05, pi / 2)          # découpage près des bords singuliers
+  sum(sapply(1:4, function(j) integrate(f, cuts[j], cuts[j + 1], rel.tol = 1e-8, subdivisions = 2000)$value)) })
+Ua <- cbind(cos(c(0, 45, 90) * pi / 180), sin(c(0, 45, 90) * pi / 180)); ga <- c(1, 1, 1) * pi / 6
+th1 <- c(-1, -1); th0 <- c(-1, 0); eps <- 10^seq(-1, -7, length.out = 25)
+nd <- sapply(eps, function(e) sqrt(sum(m_diff(th1 + (1 - e) * (th0 - th1))^2)))
+na <- sapply(eps, function(e) sqrt(sum(mfun(th1 + (1 - e) * (th0 - th1), Ua, ga, a)^2)))
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+plot(eps, na, log = "xy", type = "l", lwd = 2, col = pal["rouge"], ylim = range(c(nd, na)),
+     xlab = "distance au bord (1 - s)", ylab = "|m(θ_s)|", main = "Chemin vers θ0 = (-1, 0)")
+lines(eps, nd, lwd = 2, col = pal["bleu"])
+legend("topright", c("Γ atomique : raide", "Γ diffuse : non raide"), col = pal[c("rouge", "bleu")], lwd = 2,
+       bty = "n", cex = .8)
+## Image de Theta par m : domaine des moyennes M_F
+om <- seq(0.02, pi / 2 - 0.02, length.out = 40); rr <- exp(seq(-2, 2, length.out = 15))
+MM <- t(sapply(as.vector(outer(om, rr, paste)), function(z) {
+  v <- as.numeric(strsplit(z, " ")[[1]]); m_diff(-v[2] * c(cos(v[1]), sin(v[1]))) }))
+plot(MM, pch = 16, cex = .4, col = adjustcolor(pal["bleu"], .5), xlim = c(0, 3), ylim = c(0, 3), asp = 1,
+     xlab = "m1", ylab = "m2", main = "M_F pour Γ diffuse ≠ quart de plan")
+mb <- m_diff(c(-1, 0)); abline(0, mb[2] / mb[1], col = pal["rouge"], lwd = 2); abline(0, mb[1] / mb[2], col = pal["rouge"], lwd = 2)
+print(c(m_bord = mb, exact_m1 = a * sqrt(pi) / 2 * gamma((a + 1) / 2) / gamma(a / 2 + 1)))
+```
+
+# Correction 2 : dépendance négative pour un cône hors de l'orthant
+
+La remarque 6.7 du manuscrit (dépendance positive seulement) ne vaut que si $C\subseteq[0,\infty)^d$.
+
+```{r negdep, fig.width=6.5, fig.height=5}
+a <- 0.5; ang <- c(-60, 0, 30) * pi / 180; Un <- cbind(cos(ang), sin(ang)); gn <- c(2, 0.3, 0.5)
+thn <- c(-1, 0.2)   # -theta doit être dans l'intérieur du dual : <-theta,u_k> > 0
+stopifnot(all(-(Un %*% thn) > 0))
+Xn <- rcone(1e5, thn, Un, gn, a); V <- Vfun(thn, Un, gn, a)
+print(c(cor_theorique = V[1, 2] / sqrt(V[1, 1] * V[2, 2]), cor_MC = cor(Xn)[1, 2]))
+par(mar = c(4, 4, 2.5, 1))
+plot(Xn[1:5000, ], pch = 16, cex = .3, col = adjustcolor(pal["or"], .5), asp = 1, xlim = c(0, 8), ylim = c(-6, 4),
+     xlab = "x1", ylab = "x2", main = sprintf("Cône hors de l'orthant : corrélation %.2f", cor(Xn)[1, 2]))
+for (k in 1:3) segments(0, 0, 10 * Un[k, 1], 10 * Un[k, 2], col = pal["rouge"], lwd = 2, lty = 2)
+```
+
+# Estimation de l'indice $p$ par la variance généralisée
+
+Par le théorème 6.3, $\log\det V_F(m)=dp\log\|m\|+\text{cste}$ le long d'un rayon $m=t\,m_0$ :
+une régression log-log de déterminants empiriques donne $\hat p$.
+
+```{r estim-p, fig.height=3.6}
+a <- 0.5; p <- p_of(a); ang <- c(0, 35, 80) * pi / 180; U <- cbind(cos(ang), sin(ang)); g <- c(1, .6, .8)
+m0 <- mfun(c(-0.8, -0.6), U, g, a); tt <- exp(seq(-1, 1, length.out = 9))
+gv <- sapply(tt, function(t) { thv <- psi(t * m0, U, g, a); det(cov(rcone(4e4, thv, U, g, a))) })
+fit <- lm(log(gv) ~ log(tt)); phat <- coef(fit)[2] / 2
+par(mar = c(4, 4, 2.5, 1))
+plot(log(tt), log(gv), pch = 16, col = pal["bleu"], xlab = "log t", ylab = "log det(cov empirique)",
+     main = sprintf("p estimé = %.2f (vrai p = %.0f)", phat, p)); abline(fit, col = pal["rouge"], lwd = 2)
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```
