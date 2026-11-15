@@ -1,0 +1,649 @@
+---
+title: "Lois stables en dimension supérieure — illustrations numériques en R"
+subtitle: "Notebook compagnon de la revue de littérature (Samorodnitsky & Taqqu, ch. 2)"
+author: "Revue : vecteurs α-stables, mesure spectrale, sous-gaussiens, covariation, QCV, images"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.2, dpi = 110,
+                      dev = c("png", "cairo_pdf"), fig.path = "figs/",
+                      dev.args = list(png = list(bg = "white"), cairo_pdf = list(bg = "white")))
+```
+
+> **Conventions.** Sauf mention contraire, on travaille dans la paramétrisation
+> $S_\alpha(\sigma,\beta,\mu)$ de Samorodnitsky & Taqqu (1994), c'est-à-dire `pm = 1`
+> dans `stabledist`. **Attention :** la valeur par défaut de `stabledist::rstable` est
+> `pm = 0` (paramétrisation $S^0$ de Nolan). Les deux coïncident lorsque $\beta = 0$ ;
+> pour $\beta\neq 0$ et $\alpha\neq1$, $\mu_{S^1} = \delta_{S^0} - \beta\gamma\tan(\pi\alpha/2)$.
+> Les preuves complètes sont dans le document PDF ; ce notebook en illustre chaque partie.
+
+# Préliminaires : paquets et fonctions utilitaires
+
+```{r packages}
+# install.packages(c("stabledist", "MASS", "png"))   # si nécessaire
+library(stabledist)
+library(MASS)
+set.seed(2026)
+
+pal <- c(bleu = "#1f4e79", rouge = "#c0504d", vert = "#2e8b57",
+         or = "#d48a00", violet = "#6a3d9a", gris = "#7f7f7f")
+
+## Paramétrisation S_alpha(sigma, beta, mu) de Samorodnitsky-Taqqu (= pm = 1).
+## Générateur de Chambers-Mallows-Stuck (1976) écrit directement (cf. Weron 1996) :
+## stabledist 0.7-1 renvoie des valeurs erronées pour alpha = 1, beta != 0 (voir § 1.2).
+rS <- function(n, alpha, beta = 0, sigma = 1, mu = 0) {
+  V <- runif(n, -pi / 2, pi / 2); W <- rexp(n)
+  if (alpha == 2) return(mu + sigma * sqrt(2) * rnorm(n))
+  if (alpha != 1) {
+    tb <- beta * tan(pi * alpha / 2); B <- atan(tb) / alpha; Sab <- (1 + tb^2)^(1 / (2 * alpha))
+    X <- Sab * sin(alpha * (V + B)) / cos(V)^(1 / alpha) *
+         (cos(V - alpha * (V + B)) / W)^((1 - alpha) / alpha)
+    return(sigma * X + mu)
+  }
+  X <- (2 / pi) * ((pi / 2 + beta * V) * tan(V) -
+                   beta * log((pi / 2) * W * cos(V) / (pi / 2 + beta * V)))
+  sigma * X + (2 / pi) * beta * sigma * log(sigma) + mu
+}
+dS <- function(x, alpha, beta = 0, sigma = 1, mu = 0) dstable(x, alpha, beta, sigma, mu, pm = 1)
+pS <- function(q, alpha, beta = 0, sigma = 1, mu = 0) pstable(q, alpha, beta, sigma, mu, pm = 1)
+qS <- function(p, alpha, beta = 0, sigma = 1, mu = 0) qstable(p, alpha, beta, sigma, mu, pm = 1)
+
+## Constante de queue : x^alpha P(X > x) -> C_alpha sigma^alpha (1 + beta)/2
+C_alpha <- function(alpha) 2 * gamma(alpha) * sin(pi * alpha / 2) / pi
+
+## Vecteur alpha-stable de mesure spectrale discrète Gamma = sum_k gam_k delta(s_k)
+## (Exemple 2.3.6) : X = sum_k s_k Y_k,  Y_k ~ S_alpha(gam_k^{1/alpha}, 1, 0) indépendants
+rvec_discrete <- function(n, alpha, S, gam, mu0 = rep(0, ncol(S))) {
+  S <- as.matrix(S)
+  Y <- sapply(seq_len(nrow(S)), function(k)
+    if (gam[k] > 0) rS(n, alpha, 1, gam[k]^(1 / alpha), 0) else rep(0, n))
+  Y %*% S + matrix(mu0, n, ncol(S), byrow = TRUE)
+}
+## Paramètres des projections (b, X) : formules (2.3.3) et (2.3.4)
+sigma_b <- function(b, S, gam, alpha) sum(abs(S %*% b)^alpha * gam)^(1 / alpha)
+beta_b  <- function(b, S, gam, alpha) {
+  p <- S %*% b; w <- abs(p)^alpha * gam; sum(w * sign(p)) / sum(w)
+}
+## Vecteur sous-gaussien X = A^{1/2} G (Section 2.5)
+rsubgauss <- function(n, alpha, R) {
+  A <- rS(n, alpha / 2, 1, cos(pi * alpha / 4)^(2 / alpha), 0)
+  G <- mvrnorm(n, rep(0, nrow(R)), R)
+  sqrt(A) * G
+}
+## Estimation (alpha, sigma, beta, mu) par régression sur la fonction caractéristique
+## empirique (Press 1972 ; Koutrouvelis 1980) : log(-log|phi(t)|) = a log t + a log sigma
+cf_fit <- function(x, t = seq(0.1, 1, length.out = 10)) {
+  m <- median(x); s0 <- IQR(x) / 2; z <- (x - m) / s0
+  phi <- sapply(t, function(tt) mean(exp(1i * tt * z)))
+  co <- coef(lm(log(-log(Mod(phi))) ~ log(t)))
+  a <- min(unname(co[2]), 2); sig <- exp(unname(co[1]) / a)
+  beta <- NA; mu <- NA
+  if (abs(a - 1) > 0.05 && a < 1.98) {
+    X1 <- tan(pi * a / 2) * sig^a * t^a
+    cb <- coef(lm(Arg(phi) ~ 0 + X1 + t))
+    beta <- max(min(unname(cb[1]), 1), -1); mu <- m + unname(cb[2]) * s0
+  }
+  c(alpha = a, sigma = sig * s0, beta = beta, mu = mu)
+}
+## Affichage compressif (les queues lourdes écrasent sinon les nuages de points) :
+## compression RADIALE x -> x asinh(|x|)/|x|, qui conserve les directions (utile pour Gamma)
+ash <- function(X) { X <- as.matrix(X); r <- sqrt(rowSums(X^2)); r[r == 0] <- 1; X * asinh(r) / r }
+ash_inv <- function(U) { U <- as.matrix(U); r <- sqrt(rowSums(U^2)); r[r == 0] <- 1; U * sinh(r) / r }
+```
+
+# Rappels univariés : les quatre lois du code R proposé
+
+Le code fourni (recopié tel quel, `pm = 0` implicite) :
+
+```{r univ-code}
+# Loi normale : alpha = 2   (attention : variance = 2 gamma^2 = 2)
+X_normal <- rstable(10000, alpha = 2, beta = 0, gamma = 1, delta = 0)
+# Loi de Cauchy : alpha = 1
+X_cauchy <- rstable(10000, alpha = 1, beta = 0, gamma = 1, delta = 0)
+# Loi stable avec alpha = 1.5
+X_15 <- rstable(10000, alpha = 1.5, beta = 0, gamma = 1, delta = 0)
+# Loi stable asymétrique
+X_asym <- rstable(10000, alpha = 1.5, beta = 0.7, gamma = 1, delta = 0)
+
+ech <- list("Normale (α=2)" = X_normal, "Cauchy (α=1)" = X_cauchy,
+            "SαS α=1.5" = X_15, "α=1.5, β=0.7" = X_asym)
+round(t(sapply(ech, function(x) c(quantile(x, c(.001, .25, .5, .75, .999)),
+                                  max_abs = max(abs(x)), var_emp = var(x)))), 2)
+```
+
+## Contrôle du générateur `stabledist::rstable`
+
+```{r univ-bug}
+## Quartiles empiriques vs quartiles exacts (qstable) pour alpha = 1, beta = 0.5
+x_sd  <- rstable(1e5, 1, 0.5, 1, 0, pm = 1)      # stabledist
+x_cms <- rS(1e5, 1, 0.5, 1, 0)                    # CMS direct
+rbind(stabledist = quantile(x_sd, c(.25, .5, .75)), CMS = quantile(x_cms, c(.25, .5, .75)),
+      exact = qstable(c(.25, .5, .75), 1, 0.5, 1, 0, pm = 1),
+      n_valeurs_distinctes = c(length(unique(x_sd)), length(unique(x_cms)), NA))
+packageVersion("stabledist")
+```
+
+Avec la version 0.7-1, `rstable` produit pour $\alpha=1,\ \beta\ne0$ un échantillon quasi discret
+(quelques centaines de valeurs distinctes) : on utilise donc `rS()` partout ensuite. Les quatre lois du
+code proposé ($\beta=0$ ou $\alpha\neq1$) ne sont pas concernées.
+
+## Les quatre lois
+
+La variance empirique « explose » pour $\alpha<2$ : elle n'estime rien, car $\operatorname{Var}X=\infty$.
+
+```{r univ-densites, fig.height=5}
+par(mfrow = c(2, 2), mar = c(4, 4, 2.5, 1))
+params <- list(c(2, 0), c(1, 0), c(1.5, 0), c(1.5, 0.7))
+cols <- pal[1:4]
+for (i in 1:4) {
+  x <- ech[[i]]; a <- params[[i]][1]; b <- params[[i]][2]
+  xx <- x[abs(x) < 10]
+  hist(xx, breaks = 120, freq = FALSE, col = adjustcolor(cols[i], .35), border = NA,
+       main = names(ech)[i], xlab = "x", xlim = c(-10, 10))
+  g <- seq(-10, 10, length.out = 400)
+  # densité S0 (pm = 0) comme dans rstable(), renormalisée sur |x| < 10
+  lines(g, dstable(g, a, b, 1, 0, pm = 0) / mean(abs(x) < 10), lwd = 2, col = cols[i])
+  if (i > 1) lines(g, dnorm(g, 0, sqrt(2)) / mean(abs(x) < 10), lty = 2, col = pal["gris"])
+}
+```
+
+Courbe pleine : densité stable ; tirets : $N(0,2)$ (loi $S_2(1,0,0)$) pour comparaison.
+
+## Queues de Pareto : $P(X>x)\sim C_\alpha\sigma^\alpha\frac{1+\beta}{2}x^{-\alpha}$
+
+```{r univ-queues, fig.height=4}
+n <- 2e5
+big <- list(Cauchy = rS(n, 1), "α=1.5" = rS(n, 1.5), "α=1.5,β=0.7" = rS(n, 1.5, 0.7), "α=0.7" = rS(n, 0.7))
+ab <- list(c(1, 0), c(1.5, 0), c(1.5, 0.7), c(0.7, 0))
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+plot(NA, log = "xy", xlim = c(1, 1e4), ylim = c(1e-5, 0.5), xlab = "x", ylab = "P(X > x)",
+     main = "Queue droite (log-log)")
+for (i in 1:4) {
+  x <- sort(big[[i]][big[[i]] > 1], decreasing = TRUE); k <- seq_along(x)
+  sel <- unique(round(exp(seq(0, log(length(x)), length.out = 300))))
+  points(x[sel], k[sel] / n, pch = 16, cex = .4, col = pal[i])
+  g <- 10^seq(0.5, 4, length.out = 50); a <- ab[[i]][1]; b <- ab[[i]][2]
+  lines(g, C_alpha(a) * (1 + b) / 2 * g^(-a), col = pal[i], lwd = 1.5)
+}
+legend("bottomleft", names(big), col = pal[1:4], pch = 16, bty = "n", cex = .8)
+## Vérification de la constante : correction du facteur 2 (cf. errata du PDF)
+xs <- c(20, 50, 200, 1000, 5000)
+sf <- function(x, a) integrate(function(t) dS(t, a), x, Inf, rel.tol = 1e-8)$value  # P(X > x)
+tab <- sapply(c(0.7, 1.5), function(a) sapply(xs, function(x) x^a * sf(x, a)))
+plot(xs, tab[, 2], log = "x", ylim = c(0, 0.6), type = "b", pch = 16, col = pal["vert"],
+     xlab = "x", ylab = expression(x^alpha ~ P(X > x)), main = "Constante de queue (β = 0)")
+lines(xs, tab[, 1], type = "b", pch = 16, col = pal["rouge"])
+abline(h = C_alpha(c(1.5, 0.7)) / 2, col = pal[c("vert", "rouge")], lty = 2)
+abline(h = C_alpha(c(1.5, 0.7)) / 4, col = pal[c("vert", "rouge")], lty = 3)
+legend("topright", c("α=1.5", "α=0.7", "C_α/2 (correct)", "C_α/4 (énoncé source)"),
+       col = c(pal["vert"], pal["rouge"], 1, 1), lty = c(1, 1, 2, 3), bty = "n", cex = .8)
+```
+
+# Section 2.1 — Vecteurs stables et combinaisons linéaires
+
+On simule un vecteur 1.5-stable de $\mathbb R^2$ dont la mesure spectrale est discrète et **non symétrique**
+(4 atomes), puis on vérifie la définition (2.1.1) et le théorème 2.1.2 : toutes les projections
+$(b,X)$ sont $\alpha$-stables **avec le même indice** $\alpha$, et leurs paramètres suivent (2.3.3)–(2.3.5).
+
+```{r def-gamma}
+alpha <- 1.5
+ang <- c(0, 60, 200, 290) * pi / 180
+S <- cbind(cos(ang), sin(ang)); gam <- c(1, 0.5, 0.8, 0.3)
+X  <- rvec_discrete(4e4, alpha, S, gam)
+```
+
+```{r s21-definition, fig.height=4}
+## Définition (2.1.1) : A X1 + B X2 =d C X (+ D),  C = (A^a + B^a)^{1/a}; ici D = 0 (mu0 = 0, alpha != 1)
+A <- 1; B <- 2; C <- (A^alpha + B^alpha)^(1 / alpha)
+X1 <- rvec_discrete(4e4, alpha, S, gam); X2 <- rvec_discrete(4e4, alpha, S, gam)
+Z <- A * X1 + B * X2; W <- C * X
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+plot(ash(Z[1:4000, ]), pch = 16, cex = .3, col = adjustcolor(pal["bleu"], .5),
+     xlab = "x1 (compr. radiale)", ylab = "x2", main = "A X(1) + B X(2)  vs  C X")
+points(ash(W[1:4000, ]), pch = 16, cex = .3, col = adjustcolor(pal["rouge"], .4))
+legend("topleft", c("AX(1)+BX(2)", "CX"), col = pal[c("bleu", "rouge")], pch = 16, bty = "n")
+pp <- seq(0.01, 0.99, by = 0.01)
+plot(NA, xlim = c(-12, 12), ylim = c(-12, 12), xlab = "quantiles de (b, CX)",
+     ylab = "quantiles de (b, AX(1)+BX(2))", main = "QQ-plots de projections")
+for (j in 1:3) {
+  b <- list(c(1, 0), c(0, 1), c(1, 1) / sqrt(2))[[j]]
+  points(quantile(W %*% b, pp), quantile(Z %*% b, pp), pch = 16, cex = .5, col = pal[j + 2])
+}
+abline(0, 1, lty = 2)
+legend("topleft", c("b=(1,0)", "b=(0,1)", "b=(1,1)/√2"), col = pal[3:5], pch = 16, bty = "n")
+```
+
+```{r s21-projections, fig.height=3.6}
+phis <- seq(0, pi, length.out = 25)[-25]
+est <- t(sapply(phis, function(ph) cf_fit(X %*% c(cos(ph), sin(ph)))))
+th_sig <- sapply(phis, function(ph) sigma_b(c(cos(ph), sin(ph)), S, gam, alpha))
+th_bet <- sapply(phis, function(ph) beta_b(c(cos(ph), sin(ph)), S, gam, alpha))
+g <- seq(0, pi, length.out = 300)
+par(mfrow = c(1, 3), mar = c(4, 4, 2.5, 1))
+plot(phis, est[, "alpha"], ylim = c(1, 2), pch = 16, col = pal["bleu"], xlab = "angle φ de b",
+     ylab = expression(hat(alpha)(b)), main = "Indice (Théorème 2.1.2)"); abline(h = alpha, lty = 2)
+plot(phis, est[, "sigma"], pch = 16, col = pal["vert"], xlab = "φ", ylab = expression(sigma[b]),
+     main = "Échelle, formule (2.3.3)", ylim = c(0, max(est[, "sigma"]) * 1.1))
+lines(g, sapply(g, function(ph) sigma_b(c(cos(ph), sin(ph)), S, gam, alpha)), lwd = 2)
+plot(phis, est[, "beta"], pch = 16, col = pal["rouge"], ylim = c(-1, 1), xlab = "φ",
+     ylab = expression(beta[b]), main = "Asymétrie, formule (2.3.4)")
+lines(g, sapply(g, function(ph) beta_b(c(cos(ph), sin(ph)), S, gam, alpha)), lwd = 2)
+```
+
+# Section 2.2 — Contre-exemple de Marcus ($\alpha<1$)
+
+Pour $\Psi(\theta)=\exp\{-r^\alpha+i\rho r\cos 3\phi\}$, chaque projection $(b,X)$ est
+$S_\alpha(r_b,0,\rho r_b\cos 3\phi_b)$ : le **décalage n'est pas linéaire en $b$**, alors que
+pour un vecteur stable avec $\alpha\neq1$ on a toujours $\mu_b=(b,\mu^0)$.
+La stabilité exigerait $(2-2^{1/\alpha})\rho\cos 3\phi = D_1\cos\phi+D_2\sin\phi$ pour tout $\phi$ :
+on montre ci-dessous que le meilleur ajustement de ce type laisse un résidu non nul.
+
+```{r s22-marcus, fig.height=4}
+rho <- 0.1; ph <- seq(0, 2 * pi, length.out = 721)
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+mu_b <- rho * cos(3 * ph)
+fit_lin <- lm(mu_b ~ 0 + cos(ph) + sin(ph))
+plot(ph, mu_b, type = "l", lwd = 2, col = pal["bleu"], xlab = "angle φ de b (|b| = 1)",
+     ylab = "décalage de (b, X)", main = "μ_b = ρ cos 3φ  n'est pas linéaire en b")
+lines(ph, fitted(fit_lin), lwd = 2, lty = 2, col = pal["rouge"])
+legend("topright", c("μ_b (Marcus)", "meilleur (b, μ0)"), col = pal[c("bleu", "rouge")],
+       lty = 1:2, lwd = 2, bty = "n", cex = .8)
+alphas <- seq(0.3, 1, length.out = 50)
+resid <- sapply(alphas, function(a) {
+  f <- (2 - 2^(1 / a)) * rho * cos(3 * ph)
+  sqrt(mean(residuals(lm(f ~ 0 + cos(ph) + sin(ph)))^2))
+})
+plot(alphas, resid, type = "l", lwd = 2, col = pal["violet"], xlab = expression(alpha),
+     ylab = "résidu RMS", main = "Obstruction : nulle ssi α = 1")
+abline(h = 0, lty = 3)
+```
+
+# Section 2.3 — Fonction caractéristique et mesure spectrale
+
+Trois mesures spectrales discrètes (Proposition 2.3.7 : $\Gamma$ discrète $\iff$ $X=AY$, $Y$ à
+composantes indépendantes) et les nuages de points correspondants. Les grandes observations
+s'alignent sur les atomes de $\Gamma$.
+
+```{r s23-spectrales, fig.height=6.5}
+draw_gamma <- function(S, gam, main) {
+  th <- seq(0, 2 * pi, length.out = 200)
+  plot(cos(th), sin(th), type = "l", asp = 1, xlim = c(-2, 2), ylim = c(-2, 2),
+       col = pal["gris"], xlab = "", ylab = "", main = main)
+  sc <- 0.9 / max(gam)
+  segments(S[, 1], S[, 2], S[, 1] * (1 + sc * gam), S[, 2] * (1 + sc * gam), lwd = 4, col = pal["rouge"])
+  points(S, pch = 16, col = pal["rouge"])
+}
+alpha <- 1.5
+ex <- list(
+  list(S = rbind(c(1, 0), c(-1, 0), c(0, 1), c(0, -1)), gam = c(.85, .15, .5, .5),
+       main = "Composantes indépendantes (Ex. 2.3.5)"),
+  list(S = { Am <- cbind(c(1, .5), c(-.3, 1), c(1, -1)); U <- t(Am) / sqrt(colSums(Am^2)); rbind(U, -U) },
+       gam = c(.6, .5, .4, .6, .5, .4), main = "X = A Y, symétrique (Ex. 2.3.6)"),
+  list(S = cbind(cos(c(0, 60, 200, 290) * pi / 180), sin(c(0, 60, 200, 290) * pi / 180)),
+       gam = c(1, .5, .8, .3), main = "Non symétrique, 4 atomes"))
+par(mfrow = c(2, 3), mar = c(2.5, 2.5, 2.5, 1))
+for (e in ex) draw_gamma(e$S, e$gam, e$main)
+for (e in ex) {
+  Xe <- rvec_discrete(6000, alpha, e$S, e$gam)
+  plot(ash(Xe), pch = 16, cex = .3, col = adjustcolor(pal["bleu"], .5), asp = 1,
+       xlim = c(-7, 7), ylim = c(-7, 7), xlab = "x1 (compr. radiale)", ylab = "x2", main = "Échantillon")
+}
+```
+
+## Reproduction de la Figure 2.1 de Samorodnitsky–Taqqu
+
+$\alpha=1.5$, masse $0.2$ en $0^\circ,180^\circ$ et $0.8$ en $90^\circ,270^\circ$. Les atomes étant sur les
+axes, les composantes sont **indépendantes** (Exemple 2.3.5) : $X_1\sim S_{1.5}(0.4^{1/1.5},0,0)$,
+$X_2\sim S_{1.5}(1.6^{1/1.5},0,0)$, ce qui donne densité et intégrale depuis $(-2,-2)$ en forme produit.
+
+```{r s23-figure21, fig.height=4.2}
+alpha <- 1.5; s1 <- 0.4^(1 / alpha); s2 <- 1.6^(1 / alpha)
+g <- seq(-4, 4, length.out = 41)
+f1 <- dS(g, alpha, 0, s1); f2 <- dS(g, alpha, 0, s2)
+F1 <- pS(g, alpha, 0, s1) - pS(-2, alpha, 0, s1); F2 <- pS(g, alpha, 0, s2) - pS(-2, alpha, 0, s2)
+F1[g < -2] <- 0; F2[g < -2] <- 0
+par(mfrow = c(1, 2), mar = c(1, 1, 2, 1))
+persp(g, g, outer(f1, f2), theta = 30, phi = 25, col = "#cfe0f0", border = "#1f4e7960",
+      ticktype = "detailed", xlab = "x1", ylab = "x2", zlab = "f", main = "Densité", cex.axis = .6)
+persp(g, g, outer(F1, F2), theta = 30, phi = 25, col = "#f3d9c4", border = "#c0504d60",
+      ticktype = "detailed", xlab = "x1", ylab = "x2", zlab = "F", main = "Intégrale depuis (-2,-2)",
+      cex.axis = .6)
+```
+
+# Section 2.4 — Stabilité stricte et symétrie
+
+**La symétrie n'est pas une propriété composante par composante.** Deux exemples du texte :
+(i) $\alpha=1$ : $Y_1=X_1-X_2$, $Y_2=X_2-X_3$ avec $X_i$ i.i.d. $S_1(1,1,0)$ ;
+(ii) $\alpha=1.5$ : $\Gamma=\delta(1,0)+\delta(0,1)+2^{\alpha/2}\delta(-1/\sqrt2,-1/\sqrt2)$.
+Les marges sont symétriques, mais certaines combinaisons linéaires ne le sont pas.
+
+```{r s24-symetrie, fig.height=6}
+n <- 1e5
+Xi <- matrix(rS(3 * n, 1, 1, 1, 0), n, 3)
+Y <- cbind(Xi[, 1] - Xi[, 2], Xi[, 2] - Xi[, 3])
+L <- Y %*% c(1, 2)                      # décalage théorique (4/pi) log 2
+a <- 1.5; Sg <- rbind(c(1, 0), c(0, 1), c(-1, -1) / sqrt(2)); gg <- c(1, 1, 2^(a / 2))
+Xs <- rvec_discrete(n, a, Sg, gg); M <- Xs %*% c(1, 1)
+dens_cmp <- function(v, main, xl = c(-8, 8)) {
+  v <- v[abs(v) < 15]
+  d1 <- density(v, bw = .15, from = xl[1], to = xl[2]); d2 <- density(-v, bw = .15, from = xl[1], to = xl[2])
+  plot(d1, lwd = 2, col = pal["bleu"], main = main, xlab = "", ylim = c(0, max(d1$y, d2$y)))
+  lines(d2, lwd = 2, lty = 2, col = pal["rouge"])
+  legend("topright", c("V", "-V"), col = pal[c("bleu", "rouge")], lty = 1:2, lwd = 2, bty = "n", cex = .8)
+}
+par(mfrow = c(2, 3), mar = c(3, 3, 2.5, 1))
+dens_cmp(Y[, 1], "(i) V = Y1 : symétrique")
+dens_cmp(Y[, 2], "(i) V = Y2 : symétrique")
+dens_cmp(L, sprintf("(i) V = Y1+2Y2 : médiane %.2f", median(L)))
+abline(v = 4 / pi * log(2), col = pal["vert"], lty = 3)
+dens_cmp(Xs[, 1], "(ii) V = X1 : symétrique", c(-6, 6))
+dens_cmp(Xs[, 2], "(ii) V = X2 : symétrique", c(-6, 6))
+dens_cmp(M, sprintf("(ii) V = X1+X2 : β = %.2f", beta_b(c(1, 1), Sg, gg, a)), c(-6, 6))
+```
+
+```{r s24-checks}
+## Vérifications numériques
+c(mediane_Y1_plus_2Y2 = median(L), theorie = 4 / pi * log(2))
+## Cor. 2.4.5 : m = d(1,0)+d(0,1)+sqrt(2) d(-1/sqrt2,-1/sqrt2) vérifie int s_k dm = 0 sans être symétrique
+m_pts <- rbind(c(1, 0), c(0, 1), c(-1, -1) / sqrt(2)); m_w <- c(1, 1, sqrt(2))
+colSums(m_w * m_pts)
+## Remarque 3 (cas gaussien, rho = 0.5) : deux mesures spectrales distinctes, même forme quadratique
+rho <- 0.5
+G1 <- list(S = rbind(c(1,0), c(-1,0), c(0,1), c(0,-1), c(1,1)/sqrt(2), -c(1,1)/sqrt(2)),
+           w = c(rep((1 - rho) / 4, 4), rep(2 * rho / 4, 2)))
+u1 <- c(1, rho) / sqrt(1 + rho^2)                      # version corrigée (cf. errata)
+G2 <- list(S = rbind(c(0, 1), c(0, -1), u1, -u1), w = c(rep((1 - rho^2) / 4, 2), rep((1 + rho^2) / 4, 2)))
+th <- matrix(rnorm(10), 5, 2)
+cbind(cible = 0.5 * (th[, 1]^2 + 2 * rho * th[, 1] * th[, 2] + th[, 2]^2),
+      Gamma1 = sapply(1:5, function(i) sum((G1$S %*% th[i, ])^2 * G1$w)),
+      Gamma2 = sapply(1:5, function(i) sum((G2$S %*% th[i, ])^2 * G2$w)))
+```
+
+# Section 2.5 — Vecteurs sous-gaussiens
+
+$X=A^{1/2}G$, $A\sim S_{\alpha/2}((\cos\frac{\pi\alpha}4)^{2/\alpha},1,0)$, $G\sim N(0,R)$ :
+$E e^{i(\theta,X)}=\exp\{-|\tfrac12\theta^\top R\theta|^{\alpha/2}\}$ (Prop. 2.5.2). La structure de
+dépendance (ellipses) est héritée de $G$ ; pour $\alpha=1$ on retrouve la loi de Cauchy multivariée
+(Exemple 2.5.3), dont on superpose les lignes de niveau exactes.
+
+```{r s25-subgauss, fig.height=3.8}
+R <- matrix(c(1, .7, .7, 1), 2)
+par(mfrow = c(1, 3), mar = c(4, 4, 2.5, 1))
+for (a in c(2, 1.5, 1)) {
+  Xg <- if (a == 2) mvrnorm(5000, c(0, 0), R) else rsubgauss(5000, a, R)
+  plot(ash(Xg), pch = 16, cex = .3, col = adjustcolor(pal["bleu"], .5), asp = 1,
+       xlim = c(-6, 6), ylim = c(-6, 6), xlab = "x1 (compr. radiale)", ylab = "x2",
+       main = if (a == 2) "Gaussien G" else sprintf("Sous-gaussien α = %.1f", a))
+  if (a == 1) {           # Cauchy bivariée : Sigma = R/2
+    Sig <- R / 2; Si <- solve(Sig); ug <- seq(-6, 6, length.out = 241)
+    UV <- ash_inv(as.matrix(expand.grid(ug, ug)))          # points d'origine
+    q <- rowSums((UV %*% Si) * UV)
+    z <- matrix((1 / (2 * pi)) / sqrt(det(Sig)) / (1 + q)^1.5, length(ug))
+    contour(ug, ug, log10(z), add = TRUE, levels = -(1:7), col = pal["rouge"], drawlabels = FALSE)
+  }
+}
+```
+
+## Mesure spectrale d'un sous-gaussien (Proposition 2.5.8) et mesure angulaire des extrêmes
+
+$\Gamma=h(\Gamma_0)$ : image de la mesure uniforme par $s\mapsto\Lambda s/|\Lambda s|$ avec poids
+$|\Lambda s|^\alpha$, où $R=\Lambda\Lambda^\top$. On la compare à la loi des directions $X/|X|$ des
+grandes observations, qui converge vers $\Gamma/\Gamma(S_2)$.
+
+```{r s25-spectrale, fig.height=4}
+a <- 1.5; R <- matrix(c(1, .7, .7, 1), 2); Lam <- t(chol(R))
+N <- 20000; u <- (seq_len(N) - .5) * 2 * pi / N; s <- rbind(cos(u), sin(u))
+c0 <- 2^(-a / 2) / (2 * sqrt(pi) * gamma((a + 1) / 2) / gamma(a / 2 + 1))   # (2.5.7)
+Ls <- Lam %*% s; w <- c0 * (2 * pi / N) * sqrt(colSums(Ls^2))^a; angs <- atan2(Ls[2, ], Ls[1, ])
+## vérification de (2.5.4) via la mesure discrétisée
+bb <- rbind(c(1, 0), c(0, 1), c(1, 1) / sqrt(2), c(1, -1) / sqrt(2))
+print(cbind(spectral = sapply(1:4, function(i) sum(abs(cos(angs) * bb[i, 1] + sin(angs) * bb[i, 2])^a * w)),
+            formule = sapply(1:4, function(i) (0.5 * t(bb[i, ]) %*% R %*% bb[i, ])^(a / 2))))
+Xg <- rsubgauss(2e5, a, R); r <- sqrt(rowSums(Xg^2)); top <- r > quantile(r, .98)
+br <- seq(-pi, pi, length.out = 73)
+h_th <- tapply(w, cut(angs, br), sum) / sum(w) / diff(br)[1]
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+hist(atan2(Xg[top, 2], Xg[top, 1]), breaks = br, freq = FALSE, col = adjustcolor(pal["bleu"], .35),
+     border = "white", main = "Directions des 2 % plus grandes obs.", xlab = "angle", ylim = c(0, max(h_th) * 1.3))
+lines(br[-1] - diff(br)[1] / 2, h_th, lwd = 2, col = pal["rouge"])
+legend("topright", c("Γ/Γ(S) théorique"), col = pal["rouge"], lwd = 2, bty = "n", cex = .8)
+mid <- br[-1] - diff(br)[1] / 2; rr <- 1 + h_th / max(h_th)
+mid <- c(mid, mid[1]); rr <- c(rr, rr[1])
+plot(cos(mid) * rr, sin(mid) * rr, type = "l", lwd = 2, col = pal["rouge"], asp = 1, xlab = "", ylab = "",
+     main = "Densité de Γ en coordonnées polaires"); lines(cos(mid), sin(mid), col = pal["gris"])
+```
+
+## Covariation nulle mais dépendance (Exemple 2.7.12, Corollaire 2.5.9)
+
+```{r s25-dependance, fig.height=3.8}
+a <- 1.5; Xi <- rsubgauss(4e5, a, diag(2))
+ts <- 10^seq(0, 2, length.out = 15)
+cond <- sapply(ts, function(t) mean(abs(Xi[, 2]) > t & abs(Xi[, 1]) > t) / mean(abs(Xi[, 1]) > t))
+marg <- sapply(ts, function(t) mean(abs(Xi[, 2]) > t))
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+plot(ts, cond, log = "xy", type = "b", pch = 16, col = pal["rouge"], ylim = range(c(cond, marg)),
+     xlab = "t", ylab = "probabilité", main = "G i.i.d. : X1, X2 dépendants")
+lines(ts, marg, type = "b", pch = 16, col = pal["bleu"])
+legend("bottomleft", c("P(|X2|>t | |X1|>t)", "P(|X2|>t)"), col = pal[c("rouge", "bleu")], pch = 16, bty = "n", cex = .8)
+plot(ash(Xi[1:6000, ]), pch = 16, cex = .3, asp = 1, col = adjustcolor(pal["violet"], .5),
+     xlab = "x1 (compr. radiale)", ylab = "x2", main = "Nuage isotrope (Γ uniforme)")
+```
+
+# Section 2.7 — Covariation
+
+Pour $1<p<\alpha$ : $\dfrac{[X,Y]_\alpha}{\|Y\|_\alpha^\alpha}=\dfrac{E\,XY^{\langle p-1\rangle}}{E|Y|^p}$ (Proposition 2.7.14 du PDF).
+Pour un sous-gaussien (2.7.4) : $[X_i,X_j]_\alpha=2^{-\alpha/2}R_{ij}R_{jj}^{(\alpha-2)/2}$, donc
+$[X_1,X_2]/\|X_2\|^\alpha=R_{12}/R_{22}$ et $[X_2,X_1]/\|X_1\|^\alpha=R_{12}/R_{11}$ : la covariation
+**n'est pas symétrique** dès que $R_{11}\neq R_{22}$.
+
+```{r s27-covariation, fig.height=3.8}
+a <- 1.5; R11 <- 1; R22 <- 4; rhos <- seq(-0.9, 0.9, by = 0.15); p <- 1.05
+ratio <- function(X, Y) mean(X * sign(Y) * abs(Y)^(p - 1)) / mean(abs(Y)^p)
+res <- t(sapply(rhos, function(r) {
+  R <- matrix(c(R11, r * 2, r * 2, R22), 2); Xc <- rsubgauss(4e5, a, R)
+  c(l12 = ratio(Xc[, 1], Xc[, 2]), l21 = ratio(Xc[, 2], Xc[, 1]))
+}))
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+plot(rhos, res[, "l12"], pch = 16, col = pal["bleu"], ylim = range(res, 2 * rhos), xlab = "ρ = R12/√(R11 R22)",
+     ylab = "coefficient", main = "[X1,X2]/||X2||^α  et  [X2,X1]/||X1||^α")
+lines(rhos, 2 * rhos / R22, col = pal["bleu"], lwd = 2)
+points(rhos, res[, "l21"], pch = 17, col = pal["rouge"]); lines(rhos, 2 * rhos / R11, col = pal["rouge"], lwd = 2)
+legend("topleft", c("R12/R22", "R12/R11"), col = pal[c("bleu", "rouge")], pch = 16:17, lwd = 2, bty = "n", cex = .8)
+## Propriété 2.8.4 et inégalité triangulaire sur 2000 mesures spectrales aléatoires
+set.seed(7)
+rat <- t(replicate(2000, {
+  al <- runif(1, 1.05, 1.95); m <- 5; an <- runif(m, 0, 2 * pi); ww <- rexp(m)
+  s1 <- cos(an); s2 <- sin(an)
+  cov12 <- sum(s1 * sign(s2) * abs(s2)^(al - 1) * ww)
+  n1 <- sum(abs(s1)^al * ww)^(1 / al); n2 <- sum(abs(s2)^al * ww)^(1 / al)
+  n12 <- sum(abs(s1 + s2)^al * ww)^(1 / al)
+  c(holder = abs(cov12) / (n1 * n2^(al - 1)), triang = n12 / (n1 + n2))
+}))
+boxplot(rat, names = c("|[X,Y]|/(||X|| ||Y||^(α-1))", "||X+Y||/(||X||+||Y||)"),
+        col = adjustcolor(pal[c("vert", "or")], .5), main = "Prop. 2.8.3–2.8.4 : rapports ≤ 1", cex.axis = .75)
+abline(h = 1, lty = 2, col = pal["rouge"])
+```
+
+# Section 3 — Séries de densité et variance conditionnelle quantile (QCV)
+
+```{r s3-series, fig.height=3.8}
+ser <- function(x, a, K) {
+  if (a < 1) { k <- 1:K; sapply(x, function(xx) sum((-1)^(k - 1) / factorial(k) * gamma(a * k + 1) *
+              abs(xx)^(-a * k) * sin(pi * a * k / 2)) / (pi * abs(xx))) }
+  else { k <- 0:(K - 1); sapply(x, function(xx) sum((-1)^k / factorial(2 * k) * gamma((2 * k + 1) / a) * xx^(2 * k)) / (pi * a)) }
+}
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+x <- 10^seq(-1.3, 1.3, length.out = 120)
+plot(x, dS(x, 0.7), log = "xy", type = "l", lwd = 3, col = "grey70", xlab = "x", ylab = "f(x)",
+     main = "α = 0.7 : série en |x|^(-αk)")
+for (K in c(2, 5, 30)) lines(x, pmax(ser(x, .7, K), 1e-12), col = pal[match(K, c(2, 5, 30))], lty = 2, lwd = 1.5)
+legend("bottomleft", c("dstable", "K=2", "K=5", "K=30"), col = c("grey70", pal[1:3]), lty = c(1, 2, 2, 2), lwd = 2, bty = "n", cex = .8)
+x <- seq(0, 8, length.out = 200)
+plot(x, dS(x, 1.5), type = "l", lwd = 3, col = "grey70", ylim = c(0, .35), xlab = "x", ylab = "f(x)",
+     main = "α = 1.5 : série entière en x^(2k)")
+for (K in c(5, 15, 40)) lines(x, ser(x, 1.5, K), col = pal[match(K, c(5, 15, 40))], lty = 2, lwd = 1.5)
+legend("topright", c("dstable", "K=5", "K=15", "K=40"), col = c("grey70", pal[1:3]), lty = c(1, 2, 2, 2), lwd = 2, bty = "n", cex = .8)
+```
+
+```{r s3-qcv, fig.height=3.8}
+qcv_emp <- function(x, a, b) { q <- quantile(x, c(a, b)); var(x[x > q[1] & x < q[2]]) }
+qcv_series <- function(al, a, b, K = 80) {            # version corrigée, 1 < alpha <= 2
+  q <- qS(c(a, b), al); A <- function(i) (q[2]^i - q[1]^i) / (i * (b - a)); k <- 0:(K - 1)
+  cf <- (-1)^k / factorial(2 * k) * gamma((2 * k + 1) / al) / (pi * al)
+  sum(cf * A(2 * k + 3)) - sum(cf * A(2 * k + 2))^2
+}
+qcv_gauss  <- function(a, b) { z <- qnorm(c(a, b)); f <- dnorm(z)
+  2 * (1 + (z[1] * f[1] - z[2] * f[2]) / (b - a) - ((f[1] - f[2]) / (b - a))^2) }
+qcv_cauchy <- function(a, b) { q <- tan(pi * (c(a, b) - .5))
+  (q[2] - q[1]) / (pi * (b - a)) - 1 - (log((1 + q[2]^2) / (1 + q[1]^2)) / (2 * pi * (b - a)))^2 }
+qcv_levy <- function(a, b) { G1 <- function(z) exp(-1 / (2 * z)) / sqrt(2 * pi * z)
+  uv <- 1 / qnorm(1 - c(a, b) / 2)^2; u <- uv[1]; v <- uv[2]
+  M1 <- 2 * (v * G1(v) - u * G1(u)) - (b - a)
+  M2 <- (2 / 3) * (v^2 * G1(v) - u^2 * G1(u) - (v * G1(v) - u * G1(u))) + (b - a) / 3
+  M2 / (b - a) - (M1 / (b - a))^2 }
+qcv_int <- function(al, a, b) {                      # intégration numérique de dstable
+  q <- qS(c(a, b), al); f <- function(x) dS(x, al)
+  m1 <- integrate(function(x) x * f(x), q[1], q[2])$value / (b - a)
+  m2 <- integrate(function(x) x^2 * f(x), q[1], q[2])$value / (b - a)
+  m2 - m1^2
+}
+par(mfrow = c(1, 3), mar = c(4, 4, 2.5, 1))
+al_th <- seq(0.6, 2, by = 0.1); al_mc <- seq(0.6, 2, by = 0.2)
+for (ab in list(c(.1, .9), c(.25, .75))) {
+  col <- if (ab[1] == .1) pal["bleu"] else pal["vert"]
+  th <- sapply(al_th, qcv_int, a = ab[1], b = ab[2])
+  mc <- sapply(al_mc, function(al) qcv_emp(rS(1e5, al), ab[1], ab[2]))
+  al_s <- if (ab[1] == .1) seq(1.4, 2, by = .1) else seq(1.1, 2, by = .1)   # série stable numériquement
+  se <- sapply(al_s, qcv_series, a = ab[1], b = ab[2])
+  if (ab[1] == .1) plot(al_th, th, type = "l", lwd = 2, col = col, log = "y", ylim = c(0.2, 12),
+                        xlab = expression(alpha), ylab = "QCV (échelle log)", main = "QCV de S_α(1,0,0)")
+  else lines(al_th, th, lwd = 2, col = col)
+  points(al_mc, mc, pch = 16, col = col); points(al_s, se, pch = 2, col = col)
+  points(c(1, 2), c(qcv_cauchy(ab[1], ab[2]), qcv_gauss(ab[1], ab[2])), pch = 4, cex = 1.6, lwd = 2, col = pal["rouge"])
+}
+legend("topright", c("(0.1,0.9) intégrale", "(0.25,0.75) intégrale", "Monte-Carlo", "série (2k) corrigée",
+                     "Cauchy / Gauss exacts"), col = c(pal["bleu"], pal["vert"], 1, 1, pal["rouge"]),
+       lty = c(1, 1, NA, NA, NA), pch = c(NA, NA, 16, 2, 4), lwd = 2, bty = "n", cex = .7)
+betas <- seq(-1, 1, by = 0.25)
+plot(betas, sapply(betas, function(b) qcv_emp(rS(1e5, 1.5, b), .1, .9)), type = "b", pch = 16, col = pal["violet"],
+     xlab = expression(beta), ylab = "QCV(0.1, 0.9)", main = "α = 1.5 : effet de β (Monte-Carlo)")
+aa <- seq(0.05, 0.45, by = 0.05); lev <- 1 / rnorm(2e5)^2
+plot(aa, sapply(aa, function(a) qcv_levy(a, 1 - a)), log = "y", type = "l", lwd = 2, col = pal["or"],
+     xlab = "a  (b = 1 - a)", ylab = "QCV", main = "Lévy S_1/2(1,1,0) : formule fermée")
+points(aa, sapply(aa, function(a) qcv_emp(lev, a, 1 - a)), pch = 16, col = pal["or"])
+```
+
+# Estimation : indice par Hill et mesure spectrale par les directions extrêmes
+
+```{r est-extremes, fig.height=3.8}
+a <- 1.2; Sx <- cbind(cos(c(20, 135, 250) * pi / 180), sin(c(20, 135, 250) * pi / 180)); gx <- c(1, 2, 0.5)
+Xe <- rvec_discrete(1e5, a, Sx, gx); r <- sqrt(rowSums(Xe^2))
+ks <- seq(100, 5000, by = 100); rs <- sort(r, decreasing = TRUE)
+hill <- sapply(ks, function(k) 1 / mean(log(rs[1:k]) - log(rs[k + 1])))
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+plot(ks, hill, type = "l", lwd = 2, col = pal["bleu"], ylim = c(0.8, 1.8), xlab = "k (statistiques d'ordre)",
+     ylab = expression(hat(alpha)[Hill]), main = "Hill sur |X|"); abline(h = a, lty = 2)
+top <- r > quantile(r, .99); an <- atan2(Xe[top, 2], Xe[top, 1]) * 180 / pi
+hist(an, breaks = seq(-180, 180, by = 5), col = adjustcolor(pal["rouge"], .5), border = "white",
+     main = "Directions des 1 % plus grandes obs.", xlab = "angle (degrés)")
+abline(v = c(20, 135, -110), lty = 2)
+print(rbind(empirique = as.numeric(table(cut(an, c(-180, -50, 80, 180)))) / sum(top),
+            theorique = gx[c(3, 1, 2)] / sum(gx)))
+```
+
+# Images : bruits et champs stables, coefficients d'images naturelles
+
+## Bruits i.i.d. et champ stable à moyenne mobile
+
+Un champ $X=K*Y$ (convolution d'un bruit i.i.d. $S\alpha S$ par un noyau) est, pour tout ensemble fini
+de pixels, un vecteur $\alpha$-stable de mesure spectrale discrète (Exemple 2.3.6 / Prop. 2.3.7).
+
+```{r img-bruits, fig.height=5.2}
+nn <- 160
+conv2 <- function(Y, sd = 2) {           # convolution circulaire par FFT, noyau gaussien
+  ij <- outer(pmin(0:(nn - 1), nn - 0:(nn - 1))^2, pmin(0:(nn - 1), nn - 0:(nn - 1))^2, "+")
+  K <- exp(-ij / (2 * sd^2)); K <- K / sqrt(sum(K^2))
+  Re(fft(fft(Y) * fft(K), inverse = TRUE)) / length(Y)
+}
+gris <- gray.colors(256, 0, 1)
+showim <- function(M, main, lim = 5) image(t(pmin(pmax(M, -lim), lim))[, nn:1], col = gris, axes = FALSE, main = main,
+                                           zlim = c(-lim, lim), asp = 1)
+par(mfrow = c(2, 4), mar = c(.5, .5, 2, .5))
+als <- c(2, 1.5, 1, 0.7); noises <- lapply(als, function(a) matrix(rS(nn^2, a), nn))
+rob <- function(M) M / (IQR(M) / 1.349)                 # échelle robuste commune (IQR gaussien = 1)
+for (i in 1:4) showim(rob(noises[[i]]), sprintf("bruit i.i.d. α = %.1f", als[i]), lim = 4)
+for (i in 1:4) showim(rob(conv2(noises[[i]])), sprintf("champ K*Y, α = %.1f", als[i]), lim = 4)
+```
+
+## Coefficients de détail d'une image naturelle : queues lourdes
+
+On utilise l'image test « camera » (scikit-image, sans restriction de droits). Les différences
+horizontales de pixels ont une distribution très pointue en 0 et à queues lourdes : la loi
+gaussienne est rejetée, un modèle $S\alpha S$ ajuste nettement mieux les queues (voir le PDF pour
+les nuances : d'autres modèles, comme les gaussiennes généralisées, sont aussi utilisés).
+
+```{r img-camera, fig.height=7}
+img <- if (file.exists("camera.png")) png::readPNG("camera.png") else {
+  v <- volcano; (v - min(v)) / diff(range(v)) }           # repli si l'image est absente
+if (length(dim(img)) == 3) img <- img[, , 1]
+I <- img * 255
+dh <- as.vector(I[, -1] - I[, -ncol(I)])                  # détails horizontaux
+dv <- as.vector(I[-1, ] - I[-nrow(I), ])
+fit <- cf_fit(dh + runif(length(dh), -.5, .5))             # déquantification légère
+print(round(fit, 3))
+par(mfrow = c(2, 2), mar = c(4, 4, 2.5, 1))
+image(t(img)[, nrow(img):1], col = gris, axes = FALSE, asp = 1, main = "Image « camera »")
+br <- seq(-255.5, 255.5, by = 1); h <- hist(dh, breaks = br, plot = FALSE)
+xg <- h$mids; ok <- h$density > 0
+plot(xg[ok], h$density[ok], log = "y", pch = 16, cex = .4, col = pal["bleu"], xlim = c(-150, 150),
+     xlab = "différence horizontale", ylab = "densité (échelle log)", main = "Histogramme log : queues lourdes")
+lines(xg, dnorm(xg, mean(dh), sd(dh)), col = pal["gris"], lwd = 2, lty = 2)
+lines(xg, dS(xg, fit["alpha"], 0, fit["sigma"], 0), col = pal["rouge"], lwd = 2)
+legend("topright", c("empirique", "gaussienne (même var.)", sprintf("SαS, α̂ = %.2f", fit["alpha"])),
+       col = pal[c("bleu", "gris", "rouge")], pch = c(16, NA, NA), lty = c(NA, 2, 1), lwd = 2, bty = "n", cex = .8)
+pp <- ppoints(400)
+plot(qnorm(pp), quantile(dh, pp), pch = 16, cex = .4, col = pal["bleu"], xlab = "quantiles N(0,1)",
+     ylab = "quantiles empiriques", main = "QQ-plot gaussien"); qqline(dh, col = pal["gris"])
+ks <- seq(200, 20000, by = 200); s <- sort(abs(dh[dh != 0]), decreasing = TRUE)
+plot(ks, sapply(ks, function(k) 1 / mean(log(s[1:k]) - log(s[k + 1]))), type = "l", lwd = 2, col = pal["violet"],
+     xlab = "k", ylab = "indice de Hill", main = "Indice de queue (Hill)", ylim = c(0, 4))
+abline(h = c(fit["alpha"], 2), lty = c(1, 3), col = pal[c("rouge", "gris")])
+```
+
+## Dépendance de coefficients voisins : modèle sous-gaussien bivarié
+
+On ajuste un sous-gaussien $S\alpha S$ au couple (détail en $(i,j)$, détail en $(i+1,j)$) : $\alpha$
+par la f.c. empirique, et $R$ par $\sigma_b^2=\tfrac12 b^\top R b$ pour trois directions $b$.
+
+```{r img-bivarie, fig.height=3.8}
+D <- I[, -1] - I[, -ncol(I)]
+P <- cbind(as.vector(D[-nrow(D), ]), as.vector(D[-1, ])) + runif(2 * (nrow(D) - 1) * ncol(D), -.5, .5)
+fb <- lapply(list(c(1, 0), c(0, 1), c(1, 1) / sqrt(2)), function(b) cf_fit(P %*% b))
+ah <- mean(sapply(fb, `[`, "alpha")); sg <- sapply(fb, `[`, "sigma")
+R11 <- 2 * sg[1]^2; R22 <- 2 * sg[2]^2; R12 <- 2 * sg[3]^2 - (R11 + R22) / 2
+Rh <- matrix(c(R11, R12, R12, R22), 2); print(list(alpha = ah, R = Rh))
+Sim <- rsubgauss(nrow(P), ah, Rh); Gau <- mvrnorm(nrow(P), c(0, 0), cov(P))
+h2 <- function(M, main) {
+  br <- seq(-60, 60, by = 2); M <- M[abs(M[, 1]) < 60 & abs(M[, 2]) < 60, ]
+  tb <- table(cut(M[, 1], br), cut(M[, 2], br))
+  image(br[-1], br[-1], log10(tb + 1), col = hcl.colors(60, "YlGnBu", rev = TRUE), main = main,
+        xlab = "d(i,j)", ylab = "d(i+1,j)", asp = 1)
+}
+par(mfrow = c(1, 3), mar = c(4, 4, 2.5, 1))
+h2(P, "Image : log-histogramme"); h2(Sim, sprintf("Sous-gaussien ajusté (α̂=%.2f)", ah)); h2(Gau, "Gaussien (même cov.)")
+```
+
+# Informations de session
+
+```{r session}
+sessionInfo()
+```
